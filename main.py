@@ -1,8 +1,9 @@
 import os
-import time
 import csv
-import requests
+import asyncio
+import aiohttp
 import pandas as pd
+import requests
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain.prompts import ChatPromptTemplate
@@ -23,24 +24,33 @@ def load_zip_codes_from_csv(filename):
                 zip_codes.append(zip_code.strip())
     return sorted(set(zip_codes))
 
-# 2. Get weather data for a ZIP code
-def get_weather_forecast_structured(zip_code):
+# 2. Async weather fetch
+async def fetch_weather(session, zip_code):
     url = f"http://api.openweathermap.org/data/2.5/weather?zip={zip_code},us&appid={WEATHER_API_KEY}&units=metric"
     try:
-        response = requests.get(url, timeout=10)
-        if response.status_code != 200:
-            return None
-        data = response.json()
-        return {
-            "Zip Code": zip_code,
-            "Description": data["weather"][0]["description"],
-            "Temperature (°C)": data["main"]["temp"],
-            "Min Temp (°C)": data["main"]["temp_min"],
-            "Max Temp (°C)": data["main"]["temp_max"]
-        }
+        async with session.get(url, timeout=10) as response:
+            if response.status != 200:
+                print(f"❌ Failed {zip_code} - Status {response.status}")
+                return None
+            data = await response.json()
+            return {
+                "Zip Code": zip_code,
+                "Description": data["weather"][0]["description"],
+                "Temperature (°C)": data["main"]["temp"],
+                "Min Temp (°C)": data["main"]["temp_min"],
+                "Max Temp (°C)": data["main"]["temp_max"]
+            }
     except Exception as e:
-        print(f"Error fetching weather for {zip_code}: {e}")
+        print(f"⚠️ Error fetching {zip_code}: {e}")
         return None
+
+async def get_all_weather(zip_codes, concurrency_limit=20):
+    connector = aiohttp.TCPConnector(limit_per_host=concurrency_limit)
+    timeout = aiohttp.ClientTimeout(total=60)
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        tasks = [fetch_weather(session, zip_code) for zip_code in zip_codes]
+        results = await asyncio.gather(*tasks)
+    return [r for r in results if r]
 
 # 3. Save data to CSV
 def save_weather_data_to_csv(data, filename):
@@ -56,7 +66,6 @@ def save_weather_data_to_csv(data, filename):
 
 # 4. AI Summary using LangChain
 def generate_summary_with_llm(weather_df: pd.DataFrame) -> str:
-    # Format weather data into a string table for input
     sample_data = weather_df.head(20).to_string(index=False)
 
     prompt_text = (
@@ -75,7 +84,6 @@ def generate_summary_with_llm(weather_df: pd.DataFrame) -> str:
     llm = ChatOpenAI(model="gpt-4o", temperature=0.3)
     result = llm(prompt.format_prompt(input=prompt_text).to_messages())
     return result.content.strip()
-
 
 # 5. Send summary and CSV to Discord
 def send_results_to_discord(summary_text, file_path):
@@ -100,36 +108,21 @@ def send_results_to_discord(summary_text, file_path):
 # 6. Main pipeline
 def main():
     zip_codes = load_zip_codes_from_csv("Zip_Codes.csv")
+    print(f"🔄 Fetching weather for {len(zip_codes)} ZIP codes asynchronously...")
 
-    weather_data = []
-    chunk_size = 50
-    delay_seconds = 60
+    # Async fetch all weather data
+    weather_data = asyncio.run(get_all_weather(zip_codes, concurrency_limit=20))
+    print(f"✅ Collected weather for {len(weather_data)} locations.")
 
-    total = len(zip_codes)
-    processed = 0
-
-    for i in range(0, total, chunk_size):
-        batch = zip_codes[i:i + chunk_size]
-        print(f"\n🔄 Processing ZIP codes {i + 1} to {i + len(batch)} of {total}...\n")
-        for zip_code in batch:
-            weather = get_weather_forecast_structured(zip_code)
-            if weather:
-                weather_data.append(weather)
-            processed += 1
-            print(f"  ✅ [{processed}/{total}] {zip_code}")
-            time.sleep(1)
-        if i + chunk_size < total:
-            print(f"\n⏳ Waiting {delay_seconds} seconds before next batch...\n")
-            time.sleep(delay_seconds)
-
+    # Save to CSV
     output_csv = "weather_output.csv"
     save_weather_data_to_csv(weather_data, output_csv)
 
-    # Generate AI summary
+    # AI summary
     df = pd.DataFrame(weather_data)
     summary = generate_summary_with_llm(df)
 
-    # Send everything to Discord
+    # Send to Discord
     send_results_to_discord(summary, output_csv)
 
 if __name__ == "__main__":
