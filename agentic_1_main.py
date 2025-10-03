@@ -23,18 +23,17 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 class WeatherAgent:
     def __init__(self, zip_file="Zip_Codes.csv"):
         self.zip_codes = self.load_zip_codes(zip_file)
-        self.memory = []  # short-term memory
+        self.memory = []
         self.goals = [
             "Detect weather anomalies or rapid changes.",
             "Alert when weather varies significantly across regions.",
             "Track and visualize trends over time."
         ]
         self.last_weather_data = None
-        self.check_interval = 60
+        self.check_interval = 900  # 15 minutes
         self.cycle_count = 0
         self.llm = ChatOpenAI(model="gpt-4o", temperature=0.3)
 
-    # 1. Load ZIPs
     def load_zip_codes(self, filename):
         zip_codes = []
         with open(filename, "r") as file:
@@ -45,7 +44,6 @@ class WeatherAgent:
                     zip_codes.append(zip_code.strip())
         return sorted(set(zip_codes))
 
-    # 2. Async fetch
     async def fetch_weather(self, session, zip_code):
         url = f"http://api.openweathermap.org/data/2.5/weather?zip={zip_code},us&appid={WEATHER_API_KEY}&units=metric"
         try:
@@ -71,7 +69,6 @@ class WeatherAgent:
             results = await asyncio.gather(*tasks)
         return [r for r in results if r]
 
-    # 3. Save to CSV
     def save_csv(self, data, filename):
         if not data: return
         with open(filename, "w", newline="") as file:
@@ -79,7 +76,6 @@ class WeatherAgent:
             writer.writeheader()
             writer.writerows(data)
 
-    # 4. AI summary
     def generate_summary(self, df: pd.DataFrame):
         sample_data = df.head(20).to_string(index=False)
         prompt_text = (
@@ -94,24 +90,28 @@ class WeatherAgent:
         result = self.llm(prompt.format_prompt(input=prompt_text).to_messages())
         return result.content.strip()
 
-    # 5. Discord
     def send_to_discord(self, content, file_path=None):
         if not DISCORD_WEBHOOK_URL:
             print("Webhook not set.")
             return
         files = {}
-        if file_path and os.path.exists(file_path):
-            with open(file_path, "rb") as f:
-                files["file"] = (os.path.basename(file_path), f)
-                response = requests.post(DISCORD_WEBHOOK_URL, data={"content": content}, files=files)
-        else:
-            response = requests.post(DISCORD_WEBHOOK_URL, data={"content": content})
-        if response.ok:
-            print("✅ Sent to Discord.")
+        try:
+            if file_path and os.path.exists(file_path):
+                with open(file_path, "rb") as f:
+                    files["file"] = (os.path.basename(file_path), f)
+                    response = requests.post(DISCORD_WEBHOOK_URL, data={"content": content}, files=files)
+            else:
+                response = requests.post(DISCORD_WEBHOOK_URL, data={"content": content})
 
-    # 6. Analyze + decide
+            if response.ok:
+                print("✅ Sent to Discord.")
+            else:
+                print(f"❌ Failed to send to Discord: {response.status_code}")
+        except Exception as e:
+            print(f"❌ Discord send error: {e}")
+
     def ai_decision(self, current_data):
-        if not current_data: return {"action": "wait", "interval": 60}
+        if not current_data: return {"action": "wait", "interval": 900}
         curr_df = pd.DataFrame(current_data)
         current_avg = curr_df["Temperature (°C)"].mean()
         context = f"""
@@ -129,7 +129,7 @@ Respond in JSON:
 {{
   "situation": "...",
   "action": "...",
-  "interval": 60,
+  "interval": 900,
   "reason": "...",
   "notable_observations": [...]
 }}
@@ -138,11 +138,10 @@ Respond in JSON:
         content = result.content.strip()
         try:
             match = re.search(r"\{.*\}", content, re.DOTALL)
-            return json.loads(match.group()) if match else {"action": "wait", "interval": 60}
+            return json.loads(match.group()) if match else {"action": "wait", "interval": 900}
         except:
-            return {"action": "wait", "interval": 60}
+            return {"action": "wait", "interval": 900}
 
-    # 7. Log trends
     def log_trends(self, data, filename="weather_trends.csv"):
         df = pd.DataFrame(data)
         stats = {
@@ -159,7 +158,6 @@ Respond in JSON:
                 writer.writeheader()
             writer.writerow(stats)
 
-    # 8. Plot
     def plot_trends(self, trends_file="weather_trends.csv", plot_file="weather_plot.png"):
         if not os.path.isfile(trends_file): return
         df = pd.read_csv(trends_file)
@@ -179,7 +177,6 @@ Respond in JSON:
         print(f"📈 Trend plot saved to {plot_file}")
         return plot_file
 
-    # 9. Main agent loop
     def run(self):
         print(f"🚀 Monitoring {len(self.zip_codes)} ZIP codes")
         try:
@@ -189,32 +186,30 @@ Respond in JSON:
                 weather_data = asyncio.run(self.get_weather_data())
                 print(f"✅ Fetched data from {len(weather_data)} locations")
 
-                # Decide next action
+                # AI Decision (optional logging)
                 decision = self.ai_decision(weather_data)
                 print(f"🎯 AI Decision: {decision['action']} ({decision.get('situation', 'n/a')})")
                 print(f"📝 Reason: {decision.get('reason', '')}")
 
-                # Save + summarize if needed
+                # Save CSV
                 output_file = "weather_output.csv"
                 self.save_csv(weather_data, output_file)
 
-                if decision["action"] in ["alert", "investigate"]:
-                    df = pd.DataFrame(weather_data)
-                    summary = self.generate_summary(df)
-                    self.send_to_discord(f"📢 **AI Summary**\n{summary}", output_file)
+                # Generate summary and send to Discord
+                df = pd.DataFrame(weather_data)
+                summary = self.generate_summary(df)
+                self.send_to_discord(f"📢 **AI Summary**\n{summary}", output_file)
 
-                # Log + plot
+                # Log trends + send plot
                 self.log_trends(weather_data)
                 plot_path = self.plot_trends()
-                if decision["action"] == "alert":
-                    self.send_to_discord("📊 Temperature trend alert!", plot_path)
+                self.send_to_discord("📊 Temperature trend update:", plot_path)
 
                 # Update memory
                 self.last_weather_data = weather_data
 
-                # Wait
-                self.check_interval = decision.get("interval", 60)
-                print(f"⏳ Waiting {self.check_interval} seconds...")
+                # Fixed 15-minute interval
+                print(f"⏳ Waiting {self.check_interval // 60} minutes...")
                 time.sleep(self.check_interval)
 
         except KeyboardInterrupt:
