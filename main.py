@@ -8,7 +8,6 @@ import asyncio
 import aiohttp
 import pandas as pd
 import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
 
 from datetime import datetime
 from dotenv import load_dotenv
@@ -30,7 +29,6 @@ class WeatherAgent:
             "Track and visualize trends over time."
         ]
         self.last_weather_data = None
-        self.check_interval = 900  # 15 minutes
         self.cycle_count = 0
         self.llm = ChatOpenAI(model="gpt-4o", temperature=0.3)
 
@@ -92,26 +90,23 @@ class WeatherAgent:
 
     def send_to_discord(self, content, file_path=None):
         if not DISCORD_WEBHOOK_URL:
-            print("Webhook not set.")
+            print("❌ Webhook not set.")
             return
         files = {}
-        try:
-            if file_path and os.path.exists(file_path):
-                with open(file_path, "rb") as f:
-                    files["file"] = (os.path.basename(file_path), f)
-                    response = requests.post(DISCORD_WEBHOOK_URL, data={"content": content}, files=files)
-            else:
-                response = requests.post(DISCORD_WEBHOOK_URL, data={"content": content})
-
-            if response.ok:
-                print("✅ Sent to Discord.")
-            else:
-                print(f"❌ Failed to send to Discord: {response.status_code}")
-        except Exception as e:
-            print(f"❌ Discord send error: {e}")
+        if file_path and os.path.exists(file_path):
+            with open(file_path, "rb") as f:
+                files["file"] = (os.path.basename(file_path), f)
+                response = requests.post(DISCORD_WEBHOOK_URL, data={"content": content}, files=files)
+        else:
+            response = requests.post(DISCORD_WEBHOOK_URL, data={"content": content})
+        if response.ok:
+            print("✅ Sent to Discord.")
+        else:
+            print(f"❌ Failed to send to Discord: {response.status_code}")
 
     def ai_decision(self, current_data):
-        if not current_data: return {"action": "wait", "interval": 900}
+        if not current_data: 
+            return {"action": "wait", "interval": 900, "reason": "No data fetched."}
         curr_df = pd.DataFrame(current_data)
         current_avg = curr_df["Temperature (°C)"].mean()
         context = f"""
@@ -131,16 +126,16 @@ Respond in JSON:
   "action": "...",
   "interval": 900,
   "reason": "...",
-  "notable_observations": [...]
+  "notable_observations": []
 }}
         """
         result = self.llm.invoke(context)
         content = result.content.strip()
         try:
             match = re.search(r"\{.*\}", content, re.DOTALL)
-            return json.loads(match.group()) if match else {"action": "wait", "interval": 900}
+            return json.loads(match.group()) if match else {"action": "wait", "interval": 900, "reason": "No valid AI response."}
         except:
-            return {"action": "wait", "interval": 900}
+            return {"action": "wait", "interval": 900, "reason": "Failed to parse AI response."}
 
     def log_trends(self, data, filename="weather_trends.csv"):
         df = pd.DataFrame(data)
@@ -159,7 +154,8 @@ Respond in JSON:
             writer.writerow(stats)
 
     def plot_trends(self, trends_file="weather_trends.csv", plot_file="weather_plot.png"):
-        if not os.path.isfile(trends_file): return
+        if not os.path.isfile(trends_file): 
+            return None
         df = pd.read_csv(trends_file)
         df['timestamp'] = pd.to_datetime(df['timestamp'])
         plt.figure(figsize=(12, 6))
@@ -179,38 +175,53 @@ Respond in JSON:
 
     def run(self):
         print(f"🚀 Monitoring {len(self.zip_codes)} ZIP codes")
+        routine_summary_interval = 4  # every ~1 hour if 15m interval
+
         try:
             while True:
                 self.cycle_count += 1
-                print(f"\n🔄 Cycle #{self.cycle_count} at {datetime.now().strftime('%H:%M:%S')}")
+                print(f"\n🔄 Cycle #{self.cycle_count} started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
                 weather_data = asyncio.run(self.get_weather_data())
-                print(f"✅ Fetched data from {len(weather_data)} locations")
+                print(f"✅ Fetched data from {len(weather_data)} ZIP codes.")
 
-                # AI Decision (optional logging)
                 decision = self.ai_decision(weather_data)
-                print(f"🎯 AI Decision: {decision['action']} ({decision.get('situation', 'n/a')})")
-                print(f"📝 Reason: {decision.get('reason', '')}")
+                print(f"🤖 AI Decision: {decision.get('action', 'wait')} — {decision.get('situation', 'No situation provided')}")
+                print(f"🧠 Reason: {decision.get('reason', 'No reason provided')}")
 
-                # Save CSV
                 output_file = "weather_output.csv"
                 self.save_csv(weather_data, output_file)
+                print(f"💾 Weather data saved to {output_file}")
 
-                # Generate summary and send to Discord
-                df = pd.DataFrame(weather_data)
-                summary = self.generate_summary(df)
-                self.send_to_discord(f"📢 **AI Summary**\n{summary}", output_file)
-
-                # Log trends + send plot
                 self.log_trends(weather_data)
                 plot_path = self.plot_trends()
-                self.send_to_discord("📊 Temperature trend update:", plot_path)
 
-                # Update memory
+                send_detailed = decision['action'] in ['alert', 'investigate']
+                send_routine = (self.cycle_count % routine_summary_interval == 0)
+
+                if send_detailed:
+                    print("📡 Sending detailed alert to Discord...")
+                    df = pd.DataFrame(weather_data)
+                    summary = self.generate_summary(df)
+                    self.send_to_discord(f"🚨 **Weather Alert**\n{summary}", output_file)
+                    if plot_path:
+                        self.send_to_discord("📊 Weather trend update:", plot_path)
+
+                elif send_routine:
+                    print("ℹ️ Sending routine summary to Discord...")
+                    df = pd.DataFrame(weather_data)
+                    summary = self.generate_summary(df)
+                    self.send_to_discord(f"ℹ️ **Routine Weather Summary**\n{summary}")
+
+                else:
+                    print("🔕 No Discord update this cycle (no alert, not time for summary).")
+
                 self.last_weather_data = weather_data
 
-                # Fixed 15-minute interval
-                print(f"⏳ Waiting {self.check_interval // 60} minutes...")
-                time.sleep(self.check_interval)
+                interval = decision.get('interval', 900)
+                interval = max(300, min(900, interval))  # Clamp to 5–15 min
+                print(f"⏳ Sleeping for {interval // 60} minutes...\n")
+                time.sleep(interval)
 
         except KeyboardInterrupt:
             print("\n🛑 Monitoring stopped by user.")
