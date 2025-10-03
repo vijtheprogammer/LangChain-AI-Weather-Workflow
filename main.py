@@ -140,7 +140,7 @@ class WeatherAgent:
             print(f"⚠️ Error parsing timestamp: {e}")
             return None
 
-        plt.figure(figsize=(16, 9))
+        plt.figure(figsize=(12, 6))  # smaller figure size
         regions = df['region'].unique()
         for region in regions:
             reg_df = df[df['region'] == region].sort_values("timestamp")
@@ -152,10 +152,11 @@ class WeatherAgent:
         plt.legend(title="Region")
         plt.grid(True)
         plt.tight_layout()
-        plt.savefig(plot_file)
+        plt.savefig(plot_file, dpi=80)  # reduced DPI to shrink file size
         plt.close()
         print(f"📈 Saved region trend plot: {plot_file}")
         return plot_file
+
 
     def generate_summary(self, data):
         if not data:
@@ -187,17 +188,27 @@ class WeatherAgent:
             return
         try:
             files = []
+            opened_files = []
             for path in file_paths:
                 if os.path.exists(path):
-                    files.append(("file", (os.path.basename(path), open(path, "rb"))))
+                    f = open(path, "rb")
+                    opened_files.append(f)  # Keep reference so file stays open
+                    files.append(("file", (os.path.basename(path), f)))
+            
             payload = {"content": content}
             response = requests.post(DISCORD_WEBHOOK_URL, data=payload, files=files)
+
+            # Close files after sending
+            for f in opened_files:
+                f.close()
+
             if response.ok:
                 print("✅ Sent update to Discord.")
             else:
                 print(f"⚠️ Discord post failed: {response.status_code} - {response.text}")
         except Exception as e:
             print(f"⚠️ Exception sending Discord message: {e}")
+
 
     def run(self):
         print(f"🚀 Starting WeatherAgent with {len(self.zip_data)} ZIP codes.")
